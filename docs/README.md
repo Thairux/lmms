@@ -4,12 +4,13 @@ This folder documents custom AI extensions added in this branch:
 
 - `AIStudio` tool plugin
 - `AIAudioBridge` effect plugin
-- Offline cloud-assisted render workflow
+- Prompt-to-song generation + self-learning workflow
 
 ## Files
 
 - `docs/ai-studio.md`
 - `docs/ai-audio-bridge.md`
+- `data/ai_training/README.md`
 
 ## Status
 

@@ -1,0 +1,10 @@
+{"prompt":"UK drill beat, dark sliding 808, tight hats, 142 bpm, cinematic energy","style":"uk_drill","bpm":142,"quality":5,"drive":1.35,"guidance":4.2,"temperature":0.95}
+{"prompt":"UK drill instrumental, aggressive bounce, sparse melody, 140 bpm","style":"uk_drill","bpm":140,"quality":5,"drive":1.32,"guidance":4.0,"temperature":0.9}
+{"prompt":"Trap banger, punchy kicks, rolling hats, hard 808, 145 bpm","style":"trap","bpm":145,"quality":4,"drive":1.28,"guidance":3.8,"temperature":1.0}
+{"prompt":"Trap anthem with catchy lead, wide mix, 138 bpm","style":"trap","bpm":138,"quality":4,"drive":1.22,"guidance":3.6,"temperature":1.0}
+{"prompt":"Lo-fi chill beat, warm tape texture, soft piano, 88 bpm","style":"lofi","bpm":88,"quality":4,"drive":0.95,"guidance":3.2,"temperature":1.05}
+{"prompt":"House groove, deep bassline, bright stab chords, 124 bpm","style":"house","bpm":124,"quality":4,"drive":1.1,"guidance":3.4,"temperature":0.95}
+{"prompt":"Boom bap drums, crunchy snare, jazzy chords, 92 bpm","style":"boom_bap","bpm":92,"quality":4,"drive":1.08,"guidance":3.3,"temperature":0.95}
+{"prompt":"EDM festival drop, supersaw lead, sidechained bass, 128 bpm","style":"edm","bpm":128,"quality":4,"drive":1.2,"guidance":3.7,"temperature":1.0}
+{"prompt":"Dark electronic soundtrack, heavy low end, tense atmosphere, 120 bpm","style":"electronic","bpm":120,"quality":3,"drive":1.18,"guidance":3.4,"temperature":1.0}
+{"prompt":"Melodic drill beat with haunting choir and gliding bass, 143 bpm","style":"uk_drill","bpm":143,"quality":5,"drive":1.36,"guidance":4.3,"temperature":0.9}
