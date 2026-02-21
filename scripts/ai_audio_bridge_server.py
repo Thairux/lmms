@@ -65,6 +65,125 @@ def pick_seed(prompt: str) -> int:
     return int.from_bytes(raw[:8], "little", signed=False)
 
 
+def infer_style(prompt: str) -> str:
+    p = prompt.lower()
+    if "uk drill" in p or ("drill" in p and "uk" in p):
+        return "uk_drill"
+    if "drill" in p:
+        return "drill"
+    if "trap" in p:
+        return "trap"
+    if "house" in p:
+        return "house"
+    if "lofi" in p or "lo-fi" in p:
+        return "lofi"
+    return "electronic"
+
+
+def build_sections(total_bars: int) -> list[tuple[str, int, int, float]]:
+    # intro, verse, hook/drop, break, drop, outro
+    parts: list[tuple[str, float]] = [
+        ("intro", 0.12),
+        ("verse", 0.23),
+        ("hook", 0.20),
+        ("break", 0.10),
+        ("drop", 0.25),
+        ("outro", 0.10),
+    ]
+    energies = {
+        "intro": 0.45,
+        "verse": 0.68,
+        "hook": 0.9,
+        "break": 0.35,
+        "drop": 1.0,
+        "outro": 0.5,
+    }
+    bars_acc = 0
+    out: list[tuple[str, int, int, float]] = []
+    for idx, (name, ratio) in enumerate(parts):
+        if idx == len(parts) - 1:
+            span = total_bars - bars_acc
+        else:
+            span = max(4, int(total_bars * ratio))
+        start = bars_acc
+        end = min(total_bars, start + span)
+        out.append((name, start, end, energies[name]))
+        bars_acc = end
+    if out[-1][2] < total_bars:
+        name, s, _, e = out[-1]
+        out[-1] = (name, s, total_bars, e)
+    return out
+
+
+def section_energy(bar_idx: int, sections: list[tuple[str, int, int, float]]) -> float:
+    for _, s, e, en in sections:
+        if s <= bar_idx < e:
+            return en
+    return 0.7
+
+
+def uk_drill_snare_steps() -> set[int]:
+    # Half-time clap/snare feel
+    return {8, 12}
+
+
+def choose_kick_pattern(style: str, rng: random.Random) -> list[int]:
+    if style in ("uk_drill", "drill"):
+        patterns = [
+            [0, 5, 10, 14],
+            [0, 3, 7, 10, 13],
+            [0, 6, 9, 12, 15],
+            [0, 4, 8, 11, 14],
+        ]
+        return patterns[rng.randrange(len(patterns))]
+    if style == "trap":
+        return [0, 6, 8, 11, 14]
+    if style == "house":
+        return [0, 4, 8, 12]
+    return [0, 4, 9, 12]
+
+
+def get_cloud_song_plan(backend: str, prompt: str, seconds: int) -> dict:
+    if backend != "gemini":
+        return {}
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        return {}
+    ask = (
+        "Return strict JSON only with keys: style,bpm,mood,key_root,energy."
+        " style one of [uk_drill,drill,trap,house,lofi,electronic]."
+        " bpm integer 60-180. energy number 0.2-1.0."
+        f" Prompt: {prompt}. Duration seconds: {seconds}."
+    )
+    body = {"contents": [{"parts": [{"text": ask}]}]}
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={key}",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=25) as resp:
+        parsed = json.loads(resp.read().decode("utf-8", "ignore"))
+    text = (
+        parsed.get("candidates", [{}])[0]
+        .get("content", {})
+        .get("parts", [{}])[0]
+        .get("text", "{}")
+    )
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return {}
+
+
 def run_generate_mode(args: argparse.Namespace) -> int:
     prompt = args.prompt.strip() or "energetic electronic track"
     seed = pick_seed(prompt)
@@ -73,127 +192,194 @@ def run_generate_mode(args: argparse.Namespace) -> int:
     sr = int(args.sample_rate)
     channels = max(1, min(2, int(args.channels)))
     seconds = max(4, min(300, int(args.generate_seconds)))
-    bpm = parse_bpm(prompt, int(args.generate_bpm) if args.generate_bpm else rng.randint(110, 150))
+    style = infer_style(prompt)
+
+    cloud_plan = {}
+    if args.backend == "gemini":
+        try:
+            cloud_plan = get_cloud_song_plan(args.backend, prompt, seconds)
+        except Exception as exc:
+            print(f"warning: cloud plan failed ({exc}); using local planner", file=sys.stderr)
+
+    if "style" in cloud_plan:
+        style = str(cloud_plan["style"]).strip().lower() or style
+
+    if args.generate_bpm:
+        bpm = int(args.generate_bpm)
+    elif "bpm" in cloud_plan:
+        try:
+            bpm = int(cloud_plan["bpm"])
+        except Exception:
+            bpm = parse_bpm(prompt, rng.randint(110, 150))
+    else:
+        default_bpm = 142 if style in ("uk_drill", "drill") else 140 if style == "trap" else 124 if style == "house" else 90 if style == "lofi" else 128
+        bpm = parse_bpm(prompt, default_bpm)
+
+    bpm = max(60, min(180, bpm))
     beat_s = 60.0 / bpm
+    bar_s = beat_s * 4.0
     n = int(seconds * sr)
+    total_bars = max(4, int(seconds / bar_s))
+    sections = build_sections(total_bars)
+    master_energy = 0.8
+    if "energy" in cloud_plan:
+        try:
+            master_energy = clamp(float(cloud_plan["energy"]), 0.2, 1.0)
+        except Exception:
+            pass
 
     left = [0.0] * n
     right = [0.0] * n
 
-    base_midi = rng.choice([45, 48, 50, 52])  # A2, C3, D3, E3
-    progression = rng.choice(
-        [
-            [0, 5, 3, 4],
-            [0, 3, 5, 4],
-            [0, 7, 5, 3],
-            [0, 4, 5, 3],
-        ]
-    )
+    root_choices = [45, 47, 48, 50, 52]
+    base_root = rng.choice(root_choices)
+    progression = rng.choice([[0, 3, 5, 2], [0, 5, 3, 4], [0, 2, 5, 3], [0, 7, 5, 3]])
+    snare_steps = uk_drill_snare_steps() if style in ("uk_drill", "drill") else {4, 12}
 
-    # Kick (quarter note)
-    kick_len = int(0.22 * sr)
-    for beat in range(int(seconds / beat_s) + 1):
-        start = int(beat * beat_s * sr)
-        for j in range(kick_len):
-            i = start + j
-            if i >= n:
-                break
-            t = j / sr
-            env = math.exp(-t * 20.0)
-            freq = 140.0 - 100.0 * min(1.0, t * 8.0)
-            s = math.sin(2.0 * math.pi * freq * t) * env * 0.9
-            left[i] += s
-            right[i] += s
+    # Render per bar with section-aware density.
+    for bar in range(total_bars):
+        sec_energy = section_energy(bar, sections) * master_energy
+        kick_pattern = choose_kick_pattern(style, rng if (bar % 4 == 0) else random.Random(seed + bar))
+        bar_start_t = bar * bar_s
+        prog = progression[bar % len(progression)]
+        root = base_root + prog
+        bass_note = root - 12
 
-    # Snare (beats 2 and 4)
-    snare_len = int(0.18 * sr)
-    for bar in range(int(seconds / (beat_s * 4)) + 1):
-        for off in (1, 3):
-            start = int((bar * 4 + off) * beat_s * sr)
-            for j in range(snare_len):
-                i = start + j
+        # Drums on 16th grid
+        for step in range(16):
+            t0 = bar_start_t + step * (bar_s / 16.0)
+            i0 = int(t0 * sr)
+            if i0 >= n:
+                continue
+
+            is_kick = step in kick_pattern and rng.random() < (0.7 + 0.3 * sec_energy)
+            is_snare = step in snare_steps and rng.random() < (0.85 + 0.15 * sec_energy)
+            is_hat = (step % 2 == 0) if style in ("house", "lofi") else (step % 1 == 0)
+
+            if is_kick:
+                kl = int(0.20 * sr)
+                for j in range(kl):
+                    i = i0 + j
+                    if i >= n:
+                        break
+                    t = j / sr
+                    env = math.exp(-t * 22.0)
+                    freq = 150.0 - 105.0 * min(1.0, t * 9.0)
+                    s = math.sin(2.0 * math.pi * freq * t) * env * (0.78 + 0.22 * sec_energy)
+                    left[i] += s
+                    right[i] += s
+
+            if is_snare:
+                sl = int(0.15 * sr)
+                for j in range(sl):
+                    i = i0 + j
+                    if i >= n:
+                        break
+                    t = j / sr
+                    env = math.exp(-t * 35.0)
+                    noise = (rng.random() * 2.0 - 1.0) * env * 0.30
+                    tone = math.sin(2.0 * math.pi * 190.0 * t) * env * 0.14
+                    s = (noise + tone) * (0.8 + 0.2 * sec_energy)
+                    left[i] += s
+                    right[i] += s
+
+            if is_hat and rng.random() < (0.75 + 0.2 * sec_energy):
+                hl = int(0.03 * sr)
+                pan = -0.25 if (step % 2 == 0) else 0.25
+                for j in range(hl):
+                    i = i0 + j
+                    if i >= n:
+                        break
+                    t = j / sr
+                    env = math.exp(-t * 95.0)
+                    s = (rng.random() * 2.0 - 1.0) * env * (0.08 + 0.05 * sec_energy)
+                    left[i] += s * (1.0 - pan)
+                    right[i] += s * (1.0 + pan)
+
+                # Drill/trap micro-roll
+                if style in ("uk_drill", "drill", "trap") and step in (7, 15) and rng.random() < 0.35:
+                    roll_step = int((bar_s / 48.0) * sr)
+                    for rr in range(2):
+                        r0 = i0 + rr * roll_step
+                        for j in range(int(0.018 * sr)):
+                            i = r0 + j
+                            if i >= n:
+                                break
+                            t = j / sr
+                            env = math.exp(-t * 120.0)
+                            s = (rng.random() * 2.0 - 1.0) * env * 0.06
+                            left[i] += s
+                            right[i] += s
+
+        # Bass/808 with mild glide for drill/trap.
+        for step in range(8):
+            t0 = bar_start_t + step * (bar_s / 8.0)
+            i0 = int(t0 * sr)
+            if i0 >= n:
+                continue
+            seg = int((bar_s / 8.0) * sr)
+            gate = 0.6 + 0.4 * (1 if step % 2 == 0 else 0.7)
+            note_a = bass_note + rng.choice([0, 0, 3, 5, -2])
+            note_b = note_a + rng.choice([0, 0, 2, -2]) if style in ("uk_drill", "drill", "trap") and rng.random() < 0.35 else note_a
+            f_a = midi_to_hz(note_a)
+            f_b = midi_to_hz(note_b)
+            for j in range(seg):
+                i = i0 + j
                 if i >= n:
                     break
-                t = j / sr
-                env = math.exp(-t * 30.0)
-                noise = (rng.random() * 2.0 - 1.0) * env * 0.4
-                tone = math.sin(2.0 * math.pi * 190.0 * t) * env * 0.2
-                s = noise + tone
+                p = j / max(1, seg - 1)
+                # portamento-style slide
+                f = f_a + (f_b - f_a) * (p * p)
+                tt = (t0 + j / sr)
+                bass = (math.sin(2.0 * math.pi * f * tt) * 0.65 + math.sin(2.0 * math.pi * (f * 0.5) * tt) * 0.35)
+                amp = 0.16 * gate * (0.6 + 0.4 * sec_energy)
+                s = bass * amp
                 left[i] += s
                 right[i] += s
 
-    # Hi-hat (1/8 notes)
-    hat_len = int(0.04 * sr)
-    step = beat_s / 2.0
-    for k in range(int(seconds / step) + 1):
-        start = int(k * step * sr)
-        pan = -0.3 if (k % 2 == 0) else 0.3
-        for j in range(hat_len):
-            i = start + j
-            if i >= n:
-                break
-            t = j / sr
-            env = math.exp(-t * 80.0)
-            noise = (rng.random() * 2.0 - 1.0) * env * 0.15
-            left[i] += noise * (1.0 - pan * 0.5)
-            right[i] += noise * (1.0 + pan * 0.5)
+        # Sparse top melody/pad, more active in hook/drop.
+        if sec_energy > 0.6:
+            lead_note = root + rng.choice([12, 14, 15, 17, 19])
+            f = midi_to_hz(lead_note)
+            for j in range(int(bar_s * sr)):
+                i = int(bar_start_t * sr) + j
+                if i >= n:
+                    break
+                tt = j / sr
+                lfo = 0.5 + 0.5 * math.sin(2 * math.pi * 0.25 * tt)
+                s = math.sin(2.0 * math.pi * f * (bar_start_t + tt)) * 0.05 * lfo * sec_energy
+                left[i] += s * 0.8
+                right[i] += s * 1.2
 
-    # Bass + lead
-    sixteenth = beat_s / 4.0
-    for step_idx in range(int(seconds / sixteenth) + 1):
-        t0 = step_idx * sixteenth
-        i0 = int(t0 * sr)
-        if i0 >= n:
-            break
-        bar = int(t0 / (beat_s * 4.0))
-        prog = progression[bar % len(progression)]
-        root = base_midi + prog
-        bass_hz = midi_to_hz(root - 12)
-        lead_hz = midi_to_hz(root + rng.choice([12, 15, 19]))
-        gate = 1.0 if (step_idx % 2 == 0) else 0.6
-        seg_len = int(sixteenth * sr)
-        for j in range(seg_len):
-            i = i0 + j
-            if i >= n:
-                break
-            t = j / sr
-            phase_b = 2.0 * math.pi * bass_hz * (t0 + t)
-            bass = (math.sin(phase_b) * 0.6 + math.sin(phase_b * 0.5) * 0.4) * 0.28 * gate
-            phase_l = 2.0 * math.pi * lead_hz * (t0 + t)
-            lead = (math.sin(phase_l) + math.sin(phase_l * 1.01)) * 0.08 * (0.5 + 0.5 * math.sin(2 * math.pi * 0.2 * (t0 + t)))
-            left[i] += bass + lead * 0.8
-            right[i] += bass + lead * 1.2
-
-    # Light sidechain pump by kick envelope
+    # Global sidechain pump
     for beat in range(int(seconds / beat_s) + 1):
         start = int(beat * beat_s * sr)
-        pump_len = int(0.22 * sr)
+        pump_len = int(0.20 * sr)
         for j in range(pump_len):
             i = start + j
             if i >= n:
                 break
-            amt = 0.35 * math.exp(-j / (0.08 * sr))
+            amt = (0.2 if style == "lofi" else 0.3) * math.exp(-j / (0.08 * sr))
             left[i] *= (1.0 - amt)
             right[i] *= (1.0 - amt)
 
-    interleaved: list[float] = []
+    # Normalize + saturation drive
     peak = 1e-9
     for i in range(n):
         peak = max(peak, abs(left[i]), abs(right[i]))
-    norm = 0.9 / peak
+    norm = 0.92 / peak
 
-    drive = 1.1
+    drive = 1.2
     if args.backend in ("gemini", "deepseek"):
         try:
             drive = get_cloud_drive_hint(args.backend, prompt)
         except Exception as exc:
             print(f"warning: cloud hint failed ({exc}); using local generation drive", file=sys.stderr)
 
+    interleaved: list[float] = []
     for i in range(n):
-        l = clamp(left[i] * norm, -1.0, 1.0)
-        r = clamp(right[i] * norm, -1.0, 1.0)
-        l = math.tanh(l * drive)
-        r = math.tanh(r * drive)
+        l = math.tanh(clamp(left[i] * norm, -1.0, 1.0) * drive)
+        r = math.tanh(clamp(right[i] * norm, -1.0, 1.0) * drive)
         if channels == 1:
             interleaved.append((l + r) * 0.5)
         else:
@@ -214,10 +400,12 @@ def run_generate_mode(args: argparse.Namespace) -> int:
                 "generate_output": args.generate_output,
                 "prompt": prompt,
                 "backend": args.backend,
+                "style": style,
                 "seconds": seconds,
                 "bpm": bpm,
                 "sample_rate": sr,
                 "channels": channels,
+                "sections": [{"name": n, "start_bar": s, "end_bar": e, "energy": en} for n, s, e, en in sections],
                 "applied_drive": drive,
             }
         )
