@@ -15,9 +15,12 @@ Offline mode:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import random
+import re
 import struct
 import sys
 import urllib.request
@@ -39,6 +42,187 @@ def process_block_cloud_placeholder(samples: list[float], drive: float, backend:
     # backend/key wiring for future offline or hybrid modes.
     _ = backend
     return process_block_local(samples, drive)
+
+
+def clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+def parse_bpm(prompt: str, fallback: int) -> int:
+    m = re.search(r"(\d{2,3})\s*bpm", prompt.lower())
+    if not m:
+        return fallback
+    bpm = int(m.group(1))
+    return max(60, min(200, bpm))
+
+
+def midi_to_hz(midi: int) -> float:
+    return 440.0 * (2.0 ** ((midi - 69) / 12.0))
+
+
+def pick_seed(prompt: str) -> int:
+    raw = hashlib.sha256(prompt.encode("utf-8", "ignore")).digest()
+    return int.from_bytes(raw[:8], "little", signed=False)
+
+
+def run_generate_mode(args: argparse.Namespace) -> int:
+    prompt = args.prompt.strip() or "energetic electronic track"
+    seed = pick_seed(prompt)
+    rng = random.Random(seed)
+
+    sr = int(args.sample_rate)
+    channels = max(1, min(2, int(args.channels)))
+    seconds = max(4, min(300, int(args.generate_seconds)))
+    bpm = parse_bpm(prompt, int(args.generate_bpm) if args.generate_bpm else rng.randint(110, 150))
+    beat_s = 60.0 / bpm
+    n = int(seconds * sr)
+
+    left = [0.0] * n
+    right = [0.0] * n
+
+    base_midi = rng.choice([45, 48, 50, 52])  # A2, C3, D3, E3
+    progression = rng.choice(
+        [
+            [0, 5, 3, 4],
+            [0, 3, 5, 4],
+            [0, 7, 5, 3],
+            [0, 4, 5, 3],
+        ]
+    )
+
+    # Kick (quarter note)
+    kick_len = int(0.22 * sr)
+    for beat in range(int(seconds / beat_s) + 1):
+        start = int(beat * beat_s * sr)
+        for j in range(kick_len):
+            i = start + j
+            if i >= n:
+                break
+            t = j / sr
+            env = math.exp(-t * 20.0)
+            freq = 140.0 - 100.0 * min(1.0, t * 8.0)
+            s = math.sin(2.0 * math.pi * freq * t) * env * 0.9
+            left[i] += s
+            right[i] += s
+
+    # Snare (beats 2 and 4)
+    snare_len = int(0.18 * sr)
+    for bar in range(int(seconds / (beat_s * 4)) + 1):
+        for off in (1, 3):
+            start = int((bar * 4 + off) * beat_s * sr)
+            for j in range(snare_len):
+                i = start + j
+                if i >= n:
+                    break
+                t = j / sr
+                env = math.exp(-t * 30.0)
+                noise = (rng.random() * 2.0 - 1.0) * env * 0.4
+                tone = math.sin(2.0 * math.pi * 190.0 * t) * env * 0.2
+                s = noise + tone
+                left[i] += s
+                right[i] += s
+
+    # Hi-hat (1/8 notes)
+    hat_len = int(0.04 * sr)
+    step = beat_s / 2.0
+    for k in range(int(seconds / step) + 1):
+        start = int(k * step * sr)
+        pan = -0.3 if (k % 2 == 0) else 0.3
+        for j in range(hat_len):
+            i = start + j
+            if i >= n:
+                break
+            t = j / sr
+            env = math.exp(-t * 80.0)
+            noise = (rng.random() * 2.0 - 1.0) * env * 0.15
+            left[i] += noise * (1.0 - pan * 0.5)
+            right[i] += noise * (1.0 + pan * 0.5)
+
+    # Bass + lead
+    sixteenth = beat_s / 4.0
+    for step_idx in range(int(seconds / sixteenth) + 1):
+        t0 = step_idx * sixteenth
+        i0 = int(t0 * sr)
+        if i0 >= n:
+            break
+        bar = int(t0 / (beat_s * 4.0))
+        prog = progression[bar % len(progression)]
+        root = base_midi + prog
+        bass_hz = midi_to_hz(root - 12)
+        lead_hz = midi_to_hz(root + rng.choice([12, 15, 19]))
+        gate = 1.0 if (step_idx % 2 == 0) else 0.6
+        seg_len = int(sixteenth * sr)
+        for j in range(seg_len):
+            i = i0 + j
+            if i >= n:
+                break
+            t = j / sr
+            phase_b = 2.0 * math.pi * bass_hz * (t0 + t)
+            bass = (math.sin(phase_b) * 0.6 + math.sin(phase_b * 0.5) * 0.4) * 0.28 * gate
+            phase_l = 2.0 * math.pi * lead_hz * (t0 + t)
+            lead = (math.sin(phase_l) + math.sin(phase_l * 1.01)) * 0.08 * (0.5 + 0.5 * math.sin(2 * math.pi * 0.2 * (t0 + t)))
+            left[i] += bass + lead * 0.8
+            right[i] += bass + lead * 1.2
+
+    # Light sidechain pump by kick envelope
+    for beat in range(int(seconds / beat_s) + 1):
+        start = int(beat * beat_s * sr)
+        pump_len = int(0.22 * sr)
+        for j in range(pump_len):
+            i = start + j
+            if i >= n:
+                break
+            amt = 0.35 * math.exp(-j / (0.08 * sr))
+            left[i] *= (1.0 - amt)
+            right[i] *= (1.0 - amt)
+
+    interleaved: list[float] = []
+    peak = 1e-9
+    for i in range(n):
+        peak = max(peak, abs(left[i]), abs(right[i]))
+    norm = 0.9 / peak
+
+    drive = 1.1
+    if args.backend in ("gemini", "deepseek"):
+        try:
+            drive = get_cloud_drive_hint(args.backend, prompt)
+        except Exception as exc:
+            print(f"warning: cloud hint failed ({exc}); using local generation drive", file=sys.stderr)
+
+    for i in range(n):
+        l = clamp(left[i] * norm, -1.0, 1.0)
+        r = clamp(right[i] * norm, -1.0, 1.0)
+        l = math.tanh(l * drive)
+        r = math.tanh(r * drive)
+        if channels == 1:
+            interleaved.append((l + r) * 0.5)
+        else:
+            interleaved.extend([l, r])
+
+    ints_out = [max(-32768, min(32767, int(x * 32767.0))) for x in interleaved]
+    raw_out = struct.pack("<" + "h" * len(ints_out), *ints_out)
+
+    with wave.open(args.generate_output, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(raw_out)
+
+    print(
+        json.dumps(
+            {
+                "generate_output": args.generate_output,
+                "prompt": prompt,
+                "backend": args.backend,
+                "seconds": seconds,
+                "bpm": bpm,
+                "sample_rate": sr,
+                "channels": channels,
+                "applied_drive": drive,
+            }
+        )
+    )
+    return 0
 
 
 def get_cloud_drive_hint(backend: str, prompt: str) -> float:
@@ -171,9 +355,15 @@ def main() -> int:
     parser.add_argument("--channels", type=int, default=2)
     parser.add_argument("--offline-input")
     parser.add_argument("--offline-output")
+    parser.add_argument("--generate-output")
+    parser.add_argument("--generate-seconds", type=int, default=24)
+    parser.add_argument("--generate-bpm", type=int)
     parser.add_argument("--prompt", default="")
     parser.add_argument("--drive", type=float, default=1.2)
     args = parser.parse_args()
+
+    if args.generate_output:
+        return run_generate_mode(args)
 
     if args.offline_input or args.offline_output:
         if not args.offline_input or not args.offline_output:
