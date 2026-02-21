@@ -15,6 +15,7 @@ Offline mode:
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import math
@@ -25,10 +26,150 @@ import struct
 import sys
 import urllib.request
 import wave
+from pathlib import Path
+from typing import Any
 
 
 MAGIC = b"AIBR"
 HEADER = struct.Struct("<4sII f")
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "the",
+    "for",
+    "with",
+    "that",
+    "this",
+    "from",
+    "into",
+    "over",
+    "under",
+    "your",
+    "make",
+    "song",
+    "track",
+    "beat",
+    "music",
+}
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def safe_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return fallback
+
+
+def safe_float(value: Any, fallback: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return fallback
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                out.append(obj)
+    return out
+
+
+def append_jsonl(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def write_json(path: Path, obj: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def default_data_paths(args: argparse.Namespace) -> tuple[Path, Path, Path, Path]:
+    repo_root = Path(__file__).resolve().parents[1]
+    data_dir = Path(args.data_dir) if args.data_dir else repo_root / "data" / "ai_training"
+    feedback_path = Path(args.feedback_path) if args.feedback_path else data_dir / "feedback.jsonl"
+    labeled_path = Path(args.labeled_path) if args.labeled_path else data_dir / "labeled_prompts.jsonl"
+    profile_path = Path(args.profile_path) if args.profile_path else data_dir / "profile.json"
+    generations_path = data_dir / "generations.jsonl"
+    return feedback_path, labeled_path, profile_path, generations_path
+
+
+def tokenize_prompt(prompt: str) -> list[str]:
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9_\-]+", prompt.lower())
+    return [w for w in words if len(w) >= 3 and w not in STOPWORDS]
+
+
+def build_learning_profile(feedback_rows: list[dict[str, Any]], labeled_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    style_sum: dict[str, float] = {}
+    style_weight: dict[str, float] = {}
+    bpm_sum = 0.0
+    bpm_weight = 0.0
+    drive_sum = 0.0
+    drive_weight = 0.0
+    guidance_sum = 0.0
+    guidance_weight = 0.0
+    temp_sum = 0.0
+    temp_weight = 0.0
+
+    rows = list(labeled_rows) + list(feedback_rows)
+    for row in rows:
+        prompt = str(row.get("prompt", ""))
+        style = str(row.get("style", "") or infer_style(prompt)).strip().lower().replace(" ", "_")
+        rating = clamp(safe_float(row.get("rating", row.get("quality", 3.0)), 3.0), 1.0, 5.0)
+        weight = 0.25 + (rating / 5.0)
+        style_sum[style] = style_sum.get(style, 0.0) + (rating * weight)
+        style_weight[style] = style_weight.get(style, 0.0) + weight
+
+        bpm = safe_int(row.get("bpm", 0), 0)
+        if bpm > 0:
+            bpm_sum += bpm * weight
+            bpm_weight += weight
+        drive = safe_float(row.get("drive", 0.0), 0.0)
+        if drive > 0:
+            drive_sum += drive * weight
+            drive_weight += weight
+        guidance = safe_float(row.get("guidance", 0.0), 0.0)
+        if guidance > 0:
+            guidance_sum += guidance * weight
+            guidance_weight += weight
+        temp = safe_float(row.get("temperature", 0.0), 0.0)
+        if temp > 0:
+            temp_sum += temp * weight
+            temp_weight += weight
+
+    style_scores = {k: (style_sum[k] / max(1e-6, style_weight.get(k, 1.0))) for k in style_sum}
+    default_style = ""
+    if style_scores:
+        default_style = sorted(style_scores.items(), key=lambda kv: kv[1], reverse=True)[0][0]
+
+    return {
+        "version": 1,
+        "updated_at": now_iso(),
+        "examples": len(rows),
+        "style_scores": style_scores,
+        "default_style": default_style,
+        "preferred_bpm": int(round(bpm_sum / bpm_weight)) if bpm_weight > 0 else 0,
+        "preferred_drive": round(drive_sum / drive_weight, 4) if drive_weight > 0 else 1.2,
+        "preferred_guidance": round(guidance_sum / guidance_weight, 4) if guidance_weight > 0 else 3.5,
+        "preferred_temperature": round(temp_sum / temp_weight, 4) if temp_weight > 0 else 1.0,
+    }
 
 
 def process_block_local(samples: list[float], drive: float) -> list[float]:
@@ -184,15 +325,142 @@ def get_cloud_song_plan(backend: str, prompt: str, seconds: int) -> dict:
     return {}
 
 
+def load_profile(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def profile_for_prompt(prompt: str, profile: dict[str, Any]) -> dict[str, Any]:
+    if not profile:
+        return {}
+    out: dict[str, Any] = {}
+    if "bpm" not in prompt.lower():
+        pbpm = safe_int(profile.get("preferred_bpm", 0), 0)
+        if pbpm > 0:
+            out["bpm"] = pbpm
+    out["drive"] = clamp(safe_float(profile.get("preferred_drive", 1.2), 1.2), 0.6, 2.5)
+    out["guidance"] = clamp(safe_float(profile.get("preferred_guidance", 3.5), 3.5), 1.0, 6.0)
+    out["temperature"] = clamp(safe_float(profile.get("preferred_temperature", 1.0), 1.0), 0.2, 2.0)
+    if infer_style(prompt) == "electronic" and profile.get("default_style"):
+        out["style"] = str(profile.get("default_style")).strip().lower()
+    return out
+
+
+def write_wav_from_float(path: Path, sample_rate: int, channels: int, interleaved: list[float]) -> None:
+    ints_out = [max(-32768, min(32767, int(clamp(x, -1.0, 1.0) * 32767.0))) for x in interleaved]
+    raw_out = struct.pack("<" + "h" * len(ints_out), *ints_out)
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(raw_out)
+
+
+def can_use_musicgen() -> tuple[bool, str]:
+    try:
+        import torch  # noqa: F401
+        from transformers import AutoProcessor, MusicgenForConditionalGeneration  # noqa: F401
+    except Exception as exc:
+        return False, str(exc)
+    return True, "ok"
+
+
+def render_musicgen_song(
+    prompt: str,
+    seconds: int,
+    sample_rate: int,
+    channels: int,
+    model_id: str,
+    guidance: float,
+    temperature: float,
+    chunk_seconds: int,
+) -> tuple[list[float], dict[str, Any]]:
+    import numpy as np
+    import torch
+    from transformers import AutoProcessor, MusicgenForConditionalGeneration
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = MusicgenForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype).to(device)
+
+    total_samples = seconds * sample_rate
+    max_chunk = max(6, min(30, int(chunk_seconds)))
+    chunks: list[np.ndarray] = []
+    tokens_per_second = 50
+    remaining = seconds
+    idx = 0
+    while remaining > 0:
+        idx += 1
+        sec = min(max_chunk, remaining)
+        remaining -= sec
+        section_prompt = (
+            f"{prompt}. section {idx}. coherent arrangement, strong groove, polished mix."
+        )
+        inputs = processor(text=[section_prompt], padding=True, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        audio_values = model.generate(
+            **inputs,
+            do_sample=True,
+            guidance_scale=float(guidance),
+            temperature=float(temperature),
+            max_new_tokens=int(sec * tokens_per_second),
+        )
+        arr = audio_values[0].detach().float().cpu().numpy()
+        if arr.ndim == 2:
+            arr = arr[0]
+        chunks.append(arr)
+
+    generated_sr = int(getattr(model.config.audio_encoder, "sampling_rate", 32000))
+    if not chunks:
+        return [0.0] * (total_samples * channels), {"generated_sample_rate": generated_sr}
+    merged = chunks[0]
+    for nxt in chunks[1:]:
+        merged = np.concatenate([merged, nxt])
+    if generated_sr != sample_rate:
+        x_old = np.linspace(0.0, 1.0, num=len(merged), endpoint=False)
+        x_new = np.linspace(0.0, 1.0, num=int(len(merged) * sample_rate / generated_sr), endpoint=False)
+        merged = np.interp(x_new, x_old, merged)
+    if len(merged) < total_samples:
+        merged = np.pad(merged, (0, total_samples - len(merged)))
+    else:
+        merged = merged[:total_samples]
+    if channels == 1:
+        interleaved = merged.tolist()
+    else:
+        out = np.empty(total_samples * 2, dtype=np.float32)
+        out[0::2] = merged
+        out[1::2] = np.roll(merged, 64) * 0.98
+        interleaved = out.tolist()
+    return interleaved, {
+        "generated_sample_rate": generated_sr,
+        "model": model_id,
+        "device": device,
+    }
+
+
 def run_generate_mode(args: argparse.Namespace) -> int:
     prompt = args.prompt.strip() or "energetic electronic track"
+    feedback_path, labeled_path, profile_path, generations_path = default_data_paths(args)
+    if args.auto_learn and not profile_path.exists():
+        seed_profile = build_learning_profile(read_jsonl(feedback_path), read_jsonl(labeled_path))
+        if seed_profile.get("examples", 0) > 0:
+            write_json(profile_path, seed_profile)
+    profile = load_profile(profile_path)
+    learned = profile_for_prompt(prompt, profile)
+
     seed = pick_seed(prompt)
     rng = random.Random(seed)
 
     sr = int(args.sample_rate)
     channels = max(1, min(2, int(args.channels)))
     seconds = max(4, min(300, int(args.generate_seconds)))
-    style = infer_style(prompt)
+    style = str(learned.get("style", infer_style(prompt))).strip().lower()
 
     cloud_plan = {}
     if args.backend == "gemini":
@@ -211,11 +479,61 @@ def run_generate_mode(args: argparse.Namespace) -> int:
             bpm = int(cloud_plan["bpm"])
         except Exception:
             bpm = parse_bpm(prompt, rng.randint(110, 150))
+    elif "bpm" in learned:
+        bpm = safe_int(learned["bpm"], parse_bpm(prompt, rng.randint(110, 150)))
     else:
         default_bpm = 142 if style in ("uk_drill", "drill") else 140 if style == "trap" else 124 if style == "house" else 90 if style == "lofi" else 128
         bpm = parse_bpm(prompt, default_bpm)
 
     bpm = max(60, min(180, bpm))
+    guidance = clamp(safe_float(getattr(args, "musicgen_guidance", 3.5), safe_float(learned.get("guidance", 3.5), 3.5)), 1.0, 6.0)
+    temperature = clamp(safe_float(getattr(args, "musicgen_temperature", 1.0), safe_float(learned.get("temperature", 1.0), 1.0)), 0.2, 2.0)
+    engine = args.engine
+    if engine == "auto":
+        engine = "musicgen" if args.backend == "musicgen" else "synth"
+
+    if engine == "musicgen":
+        ok, reason = can_use_musicgen()
+        if not ok:
+            print(f"warning: musicgen unavailable ({reason}); falling back to synth", file=sys.stderr)
+            engine = "synth"
+        else:
+            try:
+                interleaved, meta = render_musicgen_song(
+                    prompt=prompt,
+                    seconds=seconds,
+                    sample_rate=sr,
+                    channels=channels,
+                    model_id=args.musicgen_model,
+                    guidance=guidance,
+                    temperature=temperature,
+                    chunk_seconds=args.musicgen_chunk_seconds,
+                )
+                write_wav_from_float(Path(args.generate_output), sr, channels, interleaved)
+                out_obj = {
+                    "generate_output": args.generate_output,
+                    "prompt": prompt,
+                    "backend": args.backend,
+                    "engine": "musicgen",
+                    "style": style,
+                    "seconds": seconds,
+                    "bpm": bpm,
+                    "sample_rate": sr,
+                    "channels": channels,
+                    "guidance": guidance,
+                    "temperature": temperature,
+                }
+                out_obj.update(meta)
+                append_jsonl(generations_path, {"timestamp": now_iso(), **out_obj})
+                if args.auto_learn:
+                    refreshed = build_learning_profile(read_jsonl(feedback_path), read_jsonl(labeled_path))
+                    if refreshed.get("examples", 0) > 0:
+                        write_json(profile_path, refreshed)
+                print(json.dumps(out_obj))
+                return 0
+            except Exception as exc:
+                print(f"warning: musicgen generation failed ({exc}); falling back to synth", file=sys.stderr)
+
     beat_s = 60.0 / bpm
     bar_s = beat_s * 4.0
     n = int(seconds * sr)
@@ -369,7 +687,7 @@ def run_generate_mode(args: argparse.Namespace) -> int:
         peak = max(peak, abs(left[i]), abs(right[i]))
     norm = 0.92 / peak
 
-    drive = 1.2
+    drive = safe_float(learned.get("drive", 1.2), 1.2)
     if args.backend in ("gemini", "deepseek"):
         try:
             drive = get_cloud_drive_hint(args.backend, prompt)
@@ -385,31 +703,28 @@ def run_generate_mode(args: argparse.Namespace) -> int:
         else:
             interleaved.extend([l, r])
 
-    ints_out = [max(-32768, min(32767, int(x * 32767.0))) for x in interleaved]
-    raw_out = struct.pack("<" + "h" * len(ints_out), *ints_out)
-
-    with wave.open(args.generate_output, "wb") as w:
-        w.setnchannels(channels)
-        w.setsampwidth(2)
-        w.setframerate(sr)
-        w.writeframes(raw_out)
-
-    print(
-        json.dumps(
-            {
-                "generate_output": args.generate_output,
-                "prompt": prompt,
-                "backend": args.backend,
-                "style": style,
-                "seconds": seconds,
-                "bpm": bpm,
-                "sample_rate": sr,
-                "channels": channels,
-                "sections": [{"name": n, "start_bar": s, "end_bar": e, "energy": en} for n, s, e, en in sections],
-                "applied_drive": drive,
-            }
-        )
-    )
+    write_wav_from_float(Path(args.generate_output), sr, channels, interleaved)
+    out_obj = {
+        "generate_output": args.generate_output,
+        "prompt": prompt,
+        "backend": args.backend,
+        "engine": "synth",
+        "style": style,
+        "seconds": seconds,
+        "bpm": bpm,
+        "sample_rate": sr,
+        "channels": channels,
+        "sections": [{"name": n, "start_bar": s, "end_bar": e, "energy": en} for n, s, e, en in sections],
+        "applied_drive": drive,
+        "guidance": guidance,
+        "temperature": temperature,
+    }
+    append_jsonl(generations_path, {"timestamp": now_iso(), **out_obj})
+    if args.auto_learn:
+        refreshed = build_learning_profile(read_jsonl(feedback_path), read_jsonl(labeled_path))
+        if refreshed.get("examples", 0) > 0:
+            write_json(profile_path, refreshed)
+    print(json.dumps(out_obj))
     return 0
 
 
@@ -488,6 +803,40 @@ def get_cloud_drive_hint(backend: str, prompt: str) -> float:
     return 1.2
 
 
+def run_feedback_mode(args: argparse.Namespace) -> int:
+    feedback_path, labeled_path, profile_path, _ = default_data_paths(args)
+    if not args.feedback_track:
+        print("feedback mode requires --feedback-track", file=sys.stderr)
+        return 11
+    item = {
+        "timestamp": now_iso(),
+        "track": args.feedback_track,
+        "prompt": args.prompt,
+        "rating": clamp(float(args.feedback_rating), 1.0, 5.0),
+        "notes": args.feedback_notes,
+        "style": args.feedback_style or infer_style(args.prompt),
+        "bpm": args.feedback_bpm,
+        "drive": args.feedback_drive,
+        "guidance": args.feedback_guidance,
+        "temperature": args.feedback_temperature,
+    }
+    append_jsonl(feedback_path, item)
+    if args.auto_learn:
+        prof = build_learning_profile(read_jsonl(feedback_path), read_jsonl(labeled_path))
+        write_json(profile_path, prof)
+    print(json.dumps({"feedback_logged": True, "file": str(feedback_path)}))
+    return 0
+
+
+def run_export_profile_mode(args: argparse.Namespace) -> int:
+    feedback_path, labeled_path, profile_path, _ = default_data_paths(args)
+    prof = build_learning_profile(read_jsonl(feedback_path), read_jsonl(labeled_path))
+    out = Path(args.learn_export) if args.learn_export else profile_path
+    write_json(out, prof)
+    print(json.dumps({"profile_exported": str(out), "examples": prof.get("examples", 0)}))
+    return 0
+
+
 def run_offline_mode(args: argparse.Namespace) -> int:
     with wave.open(args.offline_input, "rb") as r:
         channels = r.getnchannels()
@@ -538,7 +887,7 @@ def run_offline_mode(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=["local", "gemini", "deepseek"], default="local")
+    parser.add_argument("--backend", choices=["local", "gemini", "deepseek", "musicgen"], default="local")
     parser.add_argument("--sample-rate", type=int, default=44100)
     parser.add_argument("--channels", type=int, default=2)
     parser.add_argument("--offline-input")
@@ -548,7 +897,33 @@ def main() -> int:
     parser.add_argument("--generate-bpm", type=int)
     parser.add_argument("--prompt", default="")
     parser.add_argument("--drive", type=float, default=1.2)
+    parser.add_argument("--engine", choices=["auto", "synth", "musicgen"], default="auto")
+    parser.add_argument("--musicgen-model", default="facebook/musicgen-small")
+    parser.add_argument("--musicgen-guidance", type=float, default=3.5)
+    parser.add_argument("--musicgen-temperature", type=float, default=1.0)
+    parser.add_argument("--musicgen-chunk-seconds", type=int, default=18)
+
+    parser.add_argument("--data-dir", default="")
+    parser.add_argument("--feedback-path", default="")
+    parser.add_argument("--labeled-path", default="")
+    parser.add_argument("--profile-path", default="")
+    parser.add_argument("--auto-learn", action="store_true")
+
+    parser.add_argument("--feedback-track", default="")
+    parser.add_argument("--feedback-rating", type=float, default=3.0)
+    parser.add_argument("--feedback-notes", default="")
+    parser.add_argument("--feedback-style", default="")
+    parser.add_argument("--feedback-bpm", type=int, default=0)
+    parser.add_argument("--feedback-drive", type=float, default=0.0)
+    parser.add_argument("--feedback-guidance", type=float, default=0.0)
+    parser.add_argument("--feedback-temperature", type=float, default=0.0)
+    parser.add_argument("--learn-export", default="")
     args = parser.parse_args()
+
+    if args.learn_export:
+        return run_export_profile_mode(args)
+    if args.feedback_track:
+        return run_feedback_mode(args)
 
     if args.generate_output:
         return run_generate_mode(args)

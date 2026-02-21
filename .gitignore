@@ -12,3 +12,10 @@
 Brewfile.lock.json
 /.cache/
 compile_commands.json
+scripts/*.wav
+scripts/__pycache__/
+build-ai*/
+data/ai_training/feedback.jsonl
+data/ai_training/profile.json
+data/ai_training/generations.jsonl
+data/ai_training/labeled_from_scripts.jsonl
